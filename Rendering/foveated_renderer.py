@@ -1,16 +1,17 @@
 """
 Core foveated rendering engine.
 
-Implements the pixel-level rendering logic with configurable degradation patterns
-and smooth gradient transitions between zones.
+Implements truly continuous progressive foveated rendering with seamless
+transitions. Pixel density decreases smoothly with distance - no discrete
+levels or visible boundaries.
 """
 
 import numpy as np
-from typing import Tuple, Optional
+from typing import Optional
 from dataclasses import dataclass
 import logging
 
-from .config import RenderConfig, DegradationPattern, DegradationZone
+from .config import RenderConfig
 
 logger = logging.getLogger(__name__)
 
@@ -29,89 +30,13 @@ class FoveaState:
         self.active = True
 
 
-class PatternGenerator:
-    """
-    Generates pixel mask patterns for different degradation levels.
-    
-    Uses numpy for efficient array operations.
-    """
-    
-    @staticmethod
-    def should_render_pixel(x: int, y: int, pattern: DegradationPattern) -> bool:
-        """
-        Determine if a pixel should be rendered based on pattern.
-        
-        Args:
-            x: Pixel x coordinate.
-            y: Pixel y coordinate.
-            pattern: The degradation pattern to apply.
-            
-        Returns:
-            True if the pixel should be rendered, False for black.
-        """
-        if pattern == DegradationPattern.FULL:
-            return True
-        
-        elif pattern == DegradationPattern.SPARSE_1:
-            # 2 rendered, 1 black (repeating pattern of 3)
-            # Pattern: RR.RR.RR. (66% density)
-            return (x + y) % 3 != 0
-        
-        elif pattern == DegradationPattern.CHECKERBOARD:
-            # Standard checkerboard: 1 rendered, 1 black (50% density)
-            return (x + y) % 2 == 0
-        
-        elif pattern == DegradationPattern.SPARSE_2:
-            # 1 rendered, 2 black (repeating pattern of 3)
-            # Pattern: R..R..R.. (33% density)
-            return (x + y) % 3 == 0
-        
-        elif pattern == DegradationPattern.VERY_SPARSE:
-            # 1 rendered, 3 black (25% density)
-            return (x % 2 == 0) and (y % 2 == 0)
-        
-        return True
-    
-    @staticmethod
-    def create_pattern_mask(width: int, height: int, 
-                           pattern: DegradationPattern) -> np.ndarray:
-        """
-        Create a full mask array for a given pattern.
-        
-        Args:
-            width: Width of the mask.
-            height: Height of the mask.
-            pattern: The degradation pattern.
-            
-        Returns:
-            Boolean numpy array where True = render pixel.
-        """
-        y_coords, x_coords = np.ogrid[:height, :width]
-        
-        if pattern == DegradationPattern.FULL:
-            return np.ones((height, width), dtype=bool)
-        
-        elif pattern == DegradationPattern.SPARSE_1:
-            return (x_coords + y_coords) % 3 != 0
-        
-        elif pattern == DegradationPattern.CHECKERBOARD:
-            return (x_coords + y_coords) % 2 == 0
-        
-        elif pattern == DegradationPattern.SPARSE_2:
-            return (x_coords + y_coords) % 3 == 0
-        
-        elif pattern == DegradationPattern.VERY_SPARSE:
-            return (x_coords % 2 == 0) & (y_coords % 2 == 0)
-        
-        return np.ones((height, width), dtype=bool)
-
-
 class FoveatedRenderer:
     """
-    Main foveated rendering engine.
+    Foveated rendering engine with truly continuous seamless degradation.
     
-    Applies circular foveated rendering with configurable degradation zones
-    and smooth gradient transitions.
+    Uses distance-based density calculation with ordered dithering to create
+    perfectly smooth transitions. Degradation never stops - continues all
+    the way to screen corners.
     """
     
     def __init__(self, config: RenderConfig):
@@ -123,26 +48,59 @@ class FoveatedRenderer:
         """
         self.config = config
         self.fovea: Optional[FoveaState] = None
-        self._pattern_generator = PatternGenerator()
         
-        # Pre-compute pattern masks for efficiency
-        self._pattern_masks = self._precompute_pattern_masks()
+        # Pre-compute coordinate grids
+        self._x_grid, self._y_grid = np.meshgrid(
+            np.arange(config.window_width),
+            np.arange(config.window_height)
+        )
         
-        # Pre-compute distance lookup table
+        # Create ordered dithering matrix (8x8 Bayer matrix for smooth transitions)
+        self._dither_matrix = self._create_dither_matrix(8)
+        
+        # Tile the dither matrix to cover the full screen
+        self._dither_map = self._create_dither_map()
+        
+        # Distance cache
         self._distance_cache: Optional[np.ndarray] = None
         
-        logger.info(f"FoveatedRenderer initialized with {len(config.zones)} zones")
+        logger.info(f"FoveatedRenderer initialized - fovea radius: {config.fovea_radius}px")
     
-    def _precompute_pattern_masks(self) -> dict:
-        """Pre-compute pattern masks for all degradation patterns."""
-        masks = {}
-        for pattern in DegradationPattern:
-            masks[pattern] = PatternGenerator.create_pattern_mask(
-                self.config.window_width,
-                self.config.window_height,
-                pattern
-            )
-        return masks
+    def _create_dither_matrix(self, size: int) -> np.ndarray:
+        """
+        Create a Bayer ordered dithering matrix for smooth transitions.
+        
+        Args:
+            size: Size of the matrix (must be power of 2).
+            
+        Returns:
+            Normalized dither matrix (values 0 to 1).
+        """
+        if size == 2:
+            return np.array([[0, 2], [3, 1]]) / 4.0
+        
+        smaller = self._create_dither_matrix(size // 2)
+        
+        # Recursive construction of Bayer matrix
+        matrix = np.zeros((size, size))
+        matrix[:size//2, :size//2] = 4 * smaller
+        matrix[:size//2, size//2:] = 4 * smaller + 2
+        matrix[size//2:, :size//2] = 4 * smaller + 3
+        matrix[size//2:, size//2:] = 4 * smaller + 1
+        
+        return matrix / (size * size)
+    
+    def _create_dither_map(self) -> np.ndarray:
+        """Create a full-screen dither threshold map."""
+        h, w = self.config.window_height, self.config.window_width
+        dither_size = self._dither_matrix.shape[0]
+        
+        # Tile the dither matrix across the screen
+        tiles_x = (w + dither_size - 1) // dither_size
+        tiles_y = (h + dither_size - 1) // dither_size
+        
+        tiled = np.tile(self._dither_matrix, (tiles_y, tiles_x))
+        return tiled[:h, :w]
     
     def set_fovea(self, x: int, y: int) -> None:
         """
@@ -152,7 +110,6 @@ class FoveatedRenderer:
             x: X coordinate of the fovea center.
             y: Y coordinate of the fovea center.
         """
-        # Clamp to valid range
         x = max(0, min(x, self.config.window_width - 1))
         y = max(0, min(y, self.config.window_height - 1))
         
@@ -161,97 +118,135 @@ class FoveatedRenderer:
         else:
             self.fovea.update(x, y)
         
-        # Invalidate distance cache
         self._distance_cache = None
-        
         logger.debug(f"Fovea set to ({x}, {y})")
     
     def clear_fovea(self) -> None:
-        """Clear the fovea position (no focal point)."""
+        """Clear the fovea position."""
         self.fovea = None
         self._distance_cache = None
     
     def _compute_distance_map(self) -> np.ndarray:
-        """
-        Compute distance map from current fovea position.
-        
-        Returns:
-            2D array of distances from each pixel to the fovea center.
-        """
+        """Compute distance map from current fovea position."""
         if self._distance_cache is not None:
             return self._distance_cache
         
         if self.fovea is None:
-            # No fovea - return max distance everywhere
             return np.full(
                 (self.config.window_height, self.config.window_width),
                 float('inf')
             )
         
-        y_coords, x_coords = np.ogrid[:self.config.window_height, 
-                                       :self.config.window_width]
-        
-        # Euclidean distance from fovea center
-        dx = x_coords - self.fovea.x
-        dy = y_coords - self.fovea.y
+        dx = self._x_grid - self.fovea.x
+        dy = self._y_grid - self.fovea.y
         self._distance_cache = np.sqrt(dx * dx + dy * dy)
         
         return self._distance_cache
     
-    def _compute_zone_mask(self, distance_map: np.ndarray, 
-                          zone: DegradationZone,
-                          inner_radius: float) -> np.ndarray:
+    def _compute_density_map(self, distance_map: np.ndarray) -> np.ndarray:
         """
-        Compute the mask for a specific zone.
+        Compute pixel density based on distance.
+        
+        Uses a smooth function that:
+        - Returns 1.0 (100%) within fovea radius
+        - Gradually decreases beyond fovea
+        - Never reaches 0 but gets very sparse at far distances
+        
+        The degradation starts very subtle (like 10:1 ratio) and progressively
+        increases (9:1, 8:1, ... 2:1, 1:1, 1:2, 1:3, etc.)
         
         Args:
-            distance_map: Pre-computed distance map.
-            zone: The zone to compute mask for.
-            inner_radius: Inner radius of this zone.
+            distance_map: Distance from fovea for each pixel.
             
         Returns:
-            Boolean mask where True = pixel is in this zone.
+            Density values (0 to 1) for each pixel.
         """
-        return (distance_map > inner_radius) & (distance_map <= zone.outer_radius)
+        fovea_r = self.config.fovea_radius
+        
+        # Full density within fovea
+        density = np.ones_like(distance_map)
+        
+        # Beyond fovea, density decreases with distance
+        beyond_fovea = distance_map > fovea_r
+        
+        if np.any(beyond_fovea):
+            # Calculate excess distance (how far beyond fovea)
+            excess = distance_map[beyond_fovea] - fovea_r
+            
+            # Use inverse relationship for smooth continuous falloff
+            # density = fovea_r / (fovea_r + excess * rate)
+            # This gives: at excess=0 -> density=1, as excess->inf -> density->0
+            # The rate controls how fast it falls off
+            rate = self.config.degradation_rate
+            
+            # Smooth continuous density function
+            # Starts subtle and continuously decreases
+            density[beyond_fovea] = fovea_r / (fovea_r + excess * rate)
+        
+        return density
     
-    def _compute_gradient_factor(self, distance_map: np.ndarray,
-                                 zone: DegradationZone,
-                                 inner_radius: float) -> np.ndarray:
+    def _create_continuous_mask(self, distance_map: np.ndarray) -> np.ndarray:
         """
-        Compute gradient blending factors for zone transitions.
+        Create a continuous rendering mask using ordered dithering.
+        
+        The mask smoothly transitions based on distance - no discrete levels
+        or visible boundaries.
         
         Args:
-            distance_map: Pre-computed distance map.
-            zone: The zone configuration.
-            inner_radius: Inner radius of this zone.
+            distance_map: Pre-computed distance from fovea.
             
         Returns:
-            Float array of gradient factors (0.0 to 1.0).
+            Boolean mask where True = render pixel.
         """
-        if not self.config.enable_gradients or zone.gradient_width == 0:
-            return np.ones_like(distance_map)
+        # Get density (0 to 1) for each pixel
+        density = self._compute_density_map(distance_map)
         
-        gradient = np.ones_like(distance_map)
+        # Use ordered dithering: render pixel if density > dither threshold
+        # This creates smooth transitions without visible banding
+        mask = density > self._dither_map
         
-        # Gradient at inner edge (fade in)
-        if inner_radius > 0:
-            inner_gradient_end = inner_radius + zone.gradient_width
-            inner_mask = (distance_map > inner_radius) & (distance_map < inner_gradient_end)
-            if np.any(inner_mask):
-                gradient[inner_mask] = (
-                    (distance_map[inner_mask] - inner_radius) / zone.gradient_width
-                )
+        return mask
+    
+    def _apply_edge_smoothing(self, output: np.ndarray, 
+                              source: np.ndarray,
+                              mask: np.ndarray,
+                              distance_map: np.ndarray) -> np.ndarray:
+        """
+        Apply subtle opacity fade at very far distances.
         
-        # Gradient at outer edge (fade out)
-        outer_gradient_start = zone.outer_radius - zone.gradient_width
-        outer_mask = (distance_map > outer_gradient_start) & (distance_map <= zone.outer_radius)
-        if np.any(outer_mask):
-            gradient[outer_mask] = (
-                (zone.outer_radius - distance_map[outer_mask]) / zone.gradient_width
-            )
+        Args:
+            output: Current output image.
+            source: Source image.
+            mask: Render mask.
+            distance_map: Distance from fovea.
+            
+        Returns:
+            Output with smoothing applied.
+        """
+        if not self.config.enable_gradients:
+            return output
         
-        return np.clip(gradient * self.config.gradient_strength + 
-                      (1 - self.config.gradient_strength), 0, 1)
+        # Calculate max possible distance (corner to corner)
+        max_dist = np.sqrt(self.config.window_width**2 + self.config.window_height**2)
+        
+        # Very subtle fade at extreme distances
+        fade_start = max_dist * 0.5
+        
+        fade_mask = mask & (distance_map > fade_start)
+        if np.any(fade_mask):
+            # Subtle opacity reduction at far distances
+            fade_progress = (distance_map[fade_mask] - fade_start) / (max_dist - fade_start)
+            opacity = 1.0 - (fade_progress * 0.3)  # Fade to 70% at max distance
+            opacity = np.clip(opacity, 0.7, 1.0)
+            
+            for c in range(min(3, output.shape[2])):
+                blended = (
+                    source[:, :, c][fade_mask].astype(float) * opacity +
+                    self.config.background_color[c] * (1 - opacity)
+                ).astype(np.uint8)
+                output[:, :, c][fade_mask] = blended
+        
+        return output
     
     def render(self, source_image: np.ndarray) -> np.ndarray:
         """
@@ -261,10 +256,10 @@ class FoveatedRenderer:
             source_image: Input image as numpy array (H, W, 3) or (H, W, 4).
             
         Returns:
-            Rendered image with foveated degradation applied.
+            Rendered image with continuous foveated degradation.
             
         Raises:
-            ValueError: If source image dimensions don't match config.
+            ValueError: If image dimensions don't match config.
         """
         if source_image.shape[0] != self.config.window_height or \
            source_image.shape[1] != self.config.window_width:
@@ -273,118 +268,47 @@ class FoveatedRenderer:
                 f"config ({self.config.window_height}, {self.config.window_width})"
             )
         
-        # Handle both RGB and RGBA images
-        has_alpha = source_image.shape[2] == 4 if len(source_image.shape) > 2 else False
+        has_alpha = len(source_image.shape) > 2 and source_image.shape[2] == 4
         
-        # Create output image initialized with background color
+        # Initialize output with background
         output = np.zeros_like(source_image)
         if len(source_image.shape) > 2:
             output[:, :, :3] = self.config.background_color
             if has_alpha:
                 output[:, :, 3] = 255
         
-        # If no fovea set, return degraded image based on outermost zone
+        # No fovea - render with maximum distance assumption
         if self.fovea is None or not self.fovea.active:
-            outermost_pattern = self.config.zones[-1].pattern
-            mask = self._pattern_masks[outermost_pattern]
-            output[mask] = source_image[mask]
+            # Assume fovea is off-screen, use very sparse rendering
+            max_dist = np.sqrt(self.config.window_width**2 + self.config.window_height**2)
+            fake_distance = np.full_like(self._dither_map, max_dist)
+            render_mask = self._create_continuous_mask(fake_distance)
+            output[render_mask] = source_image[render_mask]
             return output
         
-        # Compute distance map
+        # Compute distance and create continuous mask
         distance_map = self._compute_distance_map()
+        render_mask = self._create_continuous_mask(distance_map)
         
-        # Process each zone
-        inner_radius = 0.0
-        for zone in self.config.zones:
-            # Get zone mask
-            zone_mask = self._compute_zone_mask(distance_map, zone, inner_radius)
-            
-            if not np.any(zone_mask):
-                inner_radius = zone.outer_radius
-                continue
-            
-            # Get pattern mask for this zone
-            pattern_mask = self._pattern_masks[zone.pattern]
-            
-            # Combine zone and pattern masks
-            combined_mask = zone_mask & pattern_mask
-            
-            # Apply gradient if enabled
-            if self.config.enable_gradients and zone.gradient_width > 0:
-                gradient_factor = self._compute_gradient_factor(
-                    distance_map, zone, inner_radius
-                )
-                
-                # Apply with gradient blending
-                for c in range(min(3, source_image.shape[2])):
-                    blended = (
-                        source_image[:, :, c].astype(float) * gradient_factor +
-                        self.config.background_color[c] * (1 - gradient_factor)
-                    ).astype(np.uint8)
-                    output[:, :, c] = np.where(combined_mask, blended, output[:, :, c])
-            else:
-                # Direct copy without gradient
-                output[combined_mask] = source_image[combined_mask]
-            
-            inner_radius = zone.outer_radius
+        # Apply mask
+        output[render_mask] = source_image[render_mask]
+        
+        # Apply subtle edge smoothing
+        output = self._apply_edge_smoothing(output, source_image, render_mask, distance_map)
         
         return output
     
     def render_optimized(self, source_image: np.ndarray) -> np.ndarray:
         """
-        Optimized rendering path using vectorized operations.
-        
-        This method is faster for large images but uses more memory.
+        Optimized rendering - same as render() for API compatibility.
         
         Args:
-            source_image: Input image as numpy array.
+            source_image: Input image.
             
         Returns:
-            Rendered image with foveated degradation applied.
+            Rendered image.
         """
-        if self.fovea is None or not self.fovea.active:
-            return self.render(source_image)
-        
-        height, width = source_image.shape[:2]
-        
-        # Compute distance map
-        distance_map = self._compute_distance_map()
-        
-        # Create output initialized with background
-        output = np.zeros_like(source_image)
-        output[:, :, :3] = self.config.background_color
-        if source_image.shape[2] == 4:
-            output[:, :, 3] = 255
-        
-        # Create combined render mask
-        render_mask = np.zeros((height, width), dtype=bool)
-        gradient_map = np.ones((height, width), dtype=float)
-        
-        inner_radius = 0.0
-        for zone in self.config.zones:
-            zone_mask = self._compute_zone_mask(distance_map, zone, inner_radius)
-            pattern_mask = self._pattern_masks[zone.pattern]
-            
-            combined = zone_mask & pattern_mask
-            render_mask |= combined
-            
-            if self.config.enable_gradients and zone.gradient_width > 0:
-                zone_gradient = self._compute_gradient_factor(
-                    distance_map, zone, inner_radius
-                )
-                gradient_map = np.where(zone_mask, zone_gradient, gradient_map)
-            
-            inner_radius = zone.outer_radius
-        
-        # Apply rendering with gradients
-        for c in range(min(3, source_image.shape[2])):
-            blended = (
-                source_image[:, :, c].astype(float) * gradient_map +
-                self.config.background_color[c] * (1 - gradient_map)
-            ).astype(np.uint8)
-            output[:, :, c] = np.where(render_mask, blended, output[:, :, c])
-        
-        return output
+        return self.render(source_image)
     
     def get_rendering_stats(self) -> dict:
         """
@@ -399,27 +323,17 @@ class FoveatedRenderer:
             'total_pixels': total_pixels,
             'fovea_active': self.fovea is not None and self.fovea.active,
             'fovea_position': (self.fovea.x, self.fovea.y) if self.fovea else None,
-            'num_zones': len(self.config.zones),
-            'zones': []
+            'fovea_radius': self.config.fovea_radius,
         }
         
         if self.fovea:
             distance_map = self._compute_distance_map()
-            inner_radius = 0.0
+            render_mask = self._create_continuous_mask(distance_map)
+            rendered_pixels = np.sum(render_mask)
             
-            for i, zone in enumerate(self.config.zones):
-                zone_mask = self._compute_zone_mask(distance_map, zone, inner_radius)
-                pattern_mask = self._pattern_masks[zone.pattern]
-                rendered_pixels = np.sum(zone_mask & pattern_mask)
-                
-                stats['zones'].append({
-                    'index': i,
-                    'pattern': zone.pattern.name,
-                    'outer_radius': zone.outer_radius,
-                    'pixels_in_zone': int(np.sum(zone_mask)),
-                    'rendered_pixels': int(rendered_pixels)
-                })
-                
-                inner_radius = zone.outer_radius
+            stats['rendered_pixels'] = int(rendered_pixels)
+            stats['render_percentage'] = round(100 * rendered_pixels / total_pixels, 2)
+            stats['pixels_saved'] = total_pixels - int(rendered_pixels)
+            stats['efficiency'] = round(100 * (1 - rendered_pixels / total_pixels), 2)
         
         return stats

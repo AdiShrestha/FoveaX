@@ -287,6 +287,9 @@ class FoveatedRenderingApp:
         
         font = pygame.font.Font(None, 24)
         
+        # Get rendering stats
+        stats = self._renderer.get_rendering_stats() if self._renderer else {}
+        
         # Prepare debug text
         lines = [
             f"FPS: {self.stats.fps:.1f}",
@@ -294,6 +297,8 @@ class FoveatedRenderingApp:
             f"Fovea: {self._renderer.fovea.x}, {self._renderer.fovea.y}" 
                 if self._renderer and self._renderer.fovea else "Fovea: None",
             f"Locked: {self._fovea_locked}",
+            f"Rendered: {stats.get('render_percentage', 0):.1f}%",
+            f"Efficiency: {stats.get('efficiency', 0):.1f}%",
             "",
             "Controls:",
             "Click - Set fovea position",
@@ -343,16 +348,16 @@ class FoveatedRenderingApp:
             1
         )
         
-        # Draw zone circles (subtle)
+        # Draw fovea radius circle (subtle)
         if self._show_debug:
-            for zone in self.config.zones[:4]:  # Only show first 4 zones
-                pygame.draw.circle(
-                    self._screen,
-                    (100, 100, 100),
-                    (fovea.x, fovea.y),
-                    zone.outer_radius,
-                    1
-                )
+            # Show fovea radius
+            pygame.draw.circle(
+                self._screen,
+                (100, 100, 100),
+                (fovea.x, fovea.y),
+                self.config.fovea_radius,
+                1
+            )
     
     def _handle_events(self) -> bool:
         """
